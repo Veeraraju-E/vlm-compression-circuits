@@ -1,0 +1,17 @@
+torch
+torchvision
+huggingface
+huggingface-hub
+transformers
+datasets
+accelerate
+numpy
+scipy
+scikit-learn
+tqdm
+matplotlib
+seaborn
+pandas
+autoawq
+wanda
+tabulate
