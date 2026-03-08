@@ -5,7 +5,7 @@ Q-VLM is separate: python src/run_qvlm_compression.py --model tinyllava --combo 
 
 Usage:
     python src/run_compression_eval.py --stage compress
-    python src/run_compression_eval.py --stage eval
+    python src/run_compression_eval.py --stage eval [--batch_size 64]
     python src/run_compression_eval.py --stage table
     python src/run_compression_eval.py --stage all [--quick]
 """
@@ -150,8 +150,13 @@ def save_log(log: dict):
         json.dump(log, f, indent=2)
 
 
+def _sanitize_comp_label(comp_label: str) -> str:
+    """Use in folder/job names: no '+', use '_' (e.g. V+P -> V_P)."""
+    return comp_label.replace("+", "_")
+
+
 def jid(model_name: str, method: str, comp_label: str) -> str:
-    return f"{model_name}__{method}__{comp_label}"
+    return f"{model_name}__{method}__{_sanitize_comp_label(comp_label)}"
 
 
 def is_done(log: dict, stage: str, job_id: str) -> bool:
@@ -241,60 +246,162 @@ def apply_wanda(model, model_name: str, components: List[str], config: dict):
 # COMPRESSION: AWQ (weight-only INT4, component-targeted)
 # =====================================================================
 #
-# IMPORTANT: AutoAWQ does NOT support OPT (BLIP-2's LLM).
-# OPT uses learned positional embeddings, not rotary embeddings.
-# AutoAWQ crashes with: 'OPTModel' object has no attribute 'rotary_emb'
-#
-# SOLUTION: We use uniform weight-only INT4 quantization (min-max
-# asymmetric, group-wise) for ALL components. This gives the same
-# bit-width as AWQ without the activation-aware scaling, which is
-# acceptable for a compression comparison baseline.
+# We follow standard AWQ practice: store packed INT4 weights with
+# scale and zero_point (per-group), and quantization_config in config.json.
+# AutoAWQ does not support BLIP-2 (OPT) or all VLM layers, so we use
+# the same quantization algorithm but save in standard AWQ format and
+# dequantize at load time for evaluation.
 #
 # =====================================================================
 
-def apply_awq_int4(model, model_name: str, components: List[str], config: dict):
+# Pack 8 x 4-bit values into one int32 (LSB to MSB: first value in low 4 bits).
+def _pack_int4(w_q: torch.Tensor) -> torch.Tensor:
+    """Pack INT4 tensor [..., N] to int32 [..., N//8]. w_q must have last dim divisible by 8."""
+    *rest, n = w_q.shape
+    w_q = w_q.reshape(-1, 8).to(torch.int32)
+    packed = (w_q[:, 0] | (w_q[:, 1] << 4) | (w_q[:, 2] << 8) | (w_q[:, 3] << 12))
+    packed = packed | (w_q[:, 4] << 16) | (w_q[:, 5] << 20) | (w_q[:, 6] << 24) | (w_q[:, 7] << 28)
+    return packed.reshape(*rest, n // 8)
+
+
+def _unpack_int4(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack int32 [..., N] to INT4 [..., N*8] (values 0..15)."""
+    out_f, in_packed = packed.shape
+    w_q = torch.zeros((out_f, in_packed * 8), dtype=torch.int32, device=packed.device)
+    for k in range(8):
+        w_q[:, k::8] = (packed >> (k * 4)) & 0xF
+    return w_q
+
+
+def build_awq_state_dict(
+    model, model_name: str, components: List[str], config: dict
+) -> Tuple[Dict[str, torch.Tensor], List[str]]:
     """
-    Weight-only INT4 quantization (asymmetric, group-wise).
-    Simulates quantization: weights are quantized then dequantized back to FP16.
-    Applied only to Linear layers in targeted components.
+    Build a state dict with AWQ-packed INT4 weights and scale/zero_point for
+    targeted Linear layers. Other weights are copied unchanged. Returns
+    (state_dict, quantized_layer_names) for saving and for load-time conversion.
     """
     bits = config["w_bit"]
     group_size = config["q_group_size"]
     paths = get_module_paths(model_name, components)
+    state_dict = dict(model.state_dict())
+    quantized_layers: List[str] = []
 
     for path in paths:
         submodule = get_submodule(model, path)
-        n_layers = 0
+        prefix = path + "."
 
         for name, child in submodule.named_modules():
             if not isinstance(child, torch.nn.Linear):
                 continue
+            full_key = (prefix + name).rstrip(".")
+            weight_key = f"{full_key}.weight"
+            if weight_key not in state_dict:
+                continue
 
-            W = child.weight.data.float()
+            W = state_dict[weight_key].float()
             out_f, in_f = W.shape
+            if in_f % 8 != 0:
+                continue  # skip if not packable
 
-            # Group-wise quantization
             gs = group_size if (group_size > 0 and in_f % group_size == 0) else in_f
             W_g = W.reshape(out_f, -1, gs)
 
             w_min = W_g.min(dim=-1, keepdim=True).values
             w_max = W_g.max(dim=-1, keepdim=True).values
-
             qmax = (1 << bits) - 1
             scale = (w_max - w_min).clamp(min=1e-8) / qmax
-            zp = torch.round(-w_min / scale).clamp(0, qmax)
+            zp = torch.round(-w_min / scale).clamp(0, qmax).to(torch.int32)
 
-            W_q = torch.round(W_g / scale + zp).clamp(0, qmax)
-            W_deq = ((W_q - zp) * scale).reshape(out_f, in_f)
+            W_q = torch.round(W_g / scale + zp).clamp(0, qmax).to(torch.int32)
+            scale = scale.squeeze(-1)  # [out_f, n_groups]
+            # Pack weight: [out_f, in_f] -> [out_f, in_f//8]
+            packed = _pack_int4(W_q.reshape(out_f, in_f))
 
-            child.weight.data.copy_(W_deq.to(child.weight.dtype))
+            state_dict.pop(weight_key, None)
+            state_dict[f"{full_key}.qweight"] = packed.to(torch.int32)
+            state_dict[f"{full_key}.scales"] = scale.float()
+            state_dict[f"{full_key}.zeros"] = zp
+            quantized_layers.append(full_key)
 
-            del W, W_g, W_q, W_deq, w_min, w_max, scale, zp
-            n_layers += 1
+    return state_dict, quantized_layers
 
-        print(f"    [AWQ-INT4] {path}: quantized {n_layers} Linear layers @ {bits}-bit")
 
-    return model
+def _awq_state_dict_to_fp16(
+    state_dict: Dict[str, torch.Tensor],
+    quantized_layers: List[str],
+    group_size: int,
+) -> Dict[str, torch.Tensor]:
+    """
+    Convert state dict from AWQ format (qweight, scales, zeros) to FP16 .weight
+    for loading into a standard model. Expands scale/zero per group to full dims.
+    """
+    out = {k: v.clone() for k, v in state_dict.items() if not k.endswith(".qweight") and not k.endswith(".scales") and not k.endswith(".zeros")}
+    for full_key in quantized_layers:
+        qkey = f"{full_key}.qweight"
+        skey = f"{full_key}.scales"
+        zkey = f"{full_key}.zeros"
+        if qkey not in state_dict:
+            continue
+        packed = state_dict[qkey]
+        scales = state_dict[skey]
+        zeros = state_dict[zkey]
+        out_f, in_packed = packed.shape
+        in_f = in_packed * 8
+        # Zeros may be stored as [out_f, n_groups, 1]; squeeze to [out_f, n_groups]
+        if zeros.ndim == 3:
+            zeros = zeros.squeeze(-1)
+        n_groups = scales.shape[1]
+        # Unpack INT4
+        w_q = _unpack_int4(packed)  # [out_f, in_f]
+        # Expand scales and zeros from [out_f, n_groups] to [out_f, in_f]
+        scales_exp = scales.repeat_interleave(group_size, dim=1)
+        zeros_exp = zeros.repeat_interleave(group_size, dim=1)
+        w_fp = (w_q.float() - zeros_exp.float()) * scales_exp
+        out[f"{full_key}.weight"] = w_fp.to(torch.float16)
+    return out
+
+
+def save_awq_checkpoint(
+    opath: str,
+    model,
+    model_name: str,
+    state_dict: Dict[str, torch.Tensor],
+    quantized_layers: List[str],
+    processor,
+    components: List[str],
+    comp_label: str,
+    paths: List[str],
+    method_config: dict,
+) -> None:
+    """Save AWQ checkpoint: packed INT4 state dict, config with quantization_config, processor, meta."""
+    from safetensors.torch import save_file
+    os.makedirs(opath, exist_ok=True)
+    # Clone tensors so tied weights (shared memory) are stored separately; safetensors rejects shared memory.
+    state_dict_to_save = {k: v.clone() for k, v in state_dict.items()}
+    save_file(state_dict_to_save, os.path.join(opath, "model.safetensors"))
+    config_dict = model.config.to_dict()
+    config_dict["quantization_config"] = {
+        "quant_method": "awq",
+        "bits": method_config["w_bit"],
+        "group_size": method_config["q_group_size"],
+        "zero_point": True,
+    }
+    config_dict["quantized_layers"] = quantized_layers
+    config_dict["base_model_id"] = MODEL_CONFIGS[model_name]["model_id"]
+    with open(os.path.join(opath, "config.json"), "w") as f:
+        json.dump(config_dict, f, indent=2)
+    processor.save_pretrained(opath)
+    meta = {
+        "model": model_name,
+        "method": "awq",
+        "components": components,
+        "comp_label": comp_label,
+        "config": method_config,
+        "module_paths": paths,
+    }
+    with open(os.path.join(opath, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
 
 
 # =====================================================================
@@ -302,7 +409,7 @@ def apply_awq_int4(model, model_name: str, components: List[str], config: dict):
 # =====================================================================
 
 def out_path(model_name: str, method: str, comp_label: str) -> str:
-    return os.path.join(OUTPUT_DIR, f"{model_name}__{method}__{comp_label}")
+    return os.path.join(OUTPUT_DIR, f"{model_name}__{method}__{_sanitize_comp_label(comp_label)}")
 
 
 def run_compression(quick: bool = False):
@@ -345,27 +452,41 @@ def run_compression(quick: bool = False):
                 if method == "wanda":
                     model = apply_wanda(model, model_name, components,
                                        METHOD_CONFIGS[method])
+                    for comp, path in zip(components, paths):
+                        total_p, nz = count_params(model, path)
+                        sp = 1.0 - (nz / total_p) if total_p else 0
+                        print(f"  Post: {comp} ({path}): {nz/1e6:.1f}M nonzero, {sp:.1%} sparse")
+                    print(f"  Saving to {opath}...")
+                    model.save_pretrained(opath, max_shard_size="2GB")
+                    processor.save_pretrained(opath)
+                    meta = {
+                        "model": model_name, "method": method,
+                        "components": components, "comp_label": comp_label,
+                        "config": METHOD_CONFIGS[method],
+                        "module_paths": paths,
+                    }
+                    with open(os.path.join(opath, "meta.json"), "w") as f:
+                        json.dump(meta, f, indent=2)
                 elif method == "awq":
-                    model = apply_awq_int4(model, model_name, components,
-                                           METHOD_CONFIGS[method])
-
-                for comp, path in zip(components, paths):
-                    total_p, nz = count_params(model, path)
-                    sp = 1.0 - (nz / total_p) if total_p else 0
-                    print(f"  Post: {comp} ({path}): {nz/1e6:.1f}M nonzero, {sp:.1%} sparse")
-
-                print(f"  Saving to {opath}...")
-                model.save_pretrained(opath, max_shard_size="2GB")
-                processor.save_pretrained(opath)
-
-                meta = {
-                    "model": model_name, "method": method,
-                    "components": components, "comp_label": comp_label,
-                    "config": METHOD_CONFIGS[method],
-                    "module_paths": paths,
-                }
-                with open(os.path.join(opath, "meta.json"), "w") as f:
-                    json.dump(meta, f, indent=2)
+                    print(f"  Building AWQ state dict (packed INT4 + scale/zero_point)...")
+                    state_dict, quantized_layers = build_awq_state_dict(
+                        model, model_name, components, METHOD_CONFIGS[method]
+                    )
+                    n_quant = len(quantized_layers)
+                    print(f"  Post: {n_quant} linear layer(s) stored as INT4 (packed) + scales/zeros")
+                    print(f"  Saving to {opath}...")
+                    save_awq_checkpoint(
+                        opath,
+                        model,
+                        model_name,
+                        state_dict,
+                        quantized_layers,
+                        processor,
+                        components,
+                        comp_label,
+                        paths,
+                        METHOD_CONFIGS[method],
+                    )
 
                 del model, processor
                 flush_gpu()
@@ -844,17 +965,69 @@ def _load_eval_data(ds_cfg: dict, limit: int):
     return ds, n_total, n_eval
 
 
-@torch.no_grad()
-def evaluate_single_model(model_name: str, model_path: str, datasets_to_eval: dict,
-                          limit: int = 0) -> dict:
-    """
-    Evaluate a single model on all specified datasets.
-    Returns {dataset_name: {"accuracy": float, "n_samples": int}}
-    """
-    flush_gpu()
-    print(f"  Loading model from {model_path}...")
+def _is_awq_checkpoint(model_path: str) -> bool:
+    """Return True if checkpoint has quantization_config.quant_method == 'awq'."""
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        return False
+    with open(config_path) as f:
+        config = json.load(f)
+    qc = config.get("quantization_config") or {}
+    return qc.get("quant_method") == "awq"
 
-    device_map = "cuda:0" if torch.cuda.is_available() else "auto"
+
+def load_model_and_processor_for_eval(
+    model_name: str, model_path: str, device_map: str
+) -> tuple:
+    """
+    Load model and processor for evaluation. For AWQ checkpoints, loads base model
+    and converts packed INT4 + scale/zero_point to FP16 in memory.
+    Returns (model, processor, build_prompt_fn).
+    """
+    if _is_awq_checkpoint(model_path):
+        from safetensors.torch import load_file
+        with open(os.path.join(model_path, "config.json")) as f:
+            config = json.load(f)
+        base_model_id = config.get("base_model_id") or MODEL_CONFIGS[model_name]["model_id"]
+        quantized_layers = config.get("quantized_layers", [])
+        group_size = (config.get("quantization_config") or {}).get("group_size", 128)
+        state_dict = load_file(os.path.join(model_path, "model.safetensors"))
+        converted = _awq_state_dict_to_fp16(state_dict, quantized_layers, group_size)
+        if model_name == "blip2":
+            from transformers import BlipForQuestionAnswering, BlipProcessor
+            model = BlipForQuestionAnswering.from_pretrained(
+                base_model_id, torch_dtype=torch.float16,
+                low_cpu_mem_usage=True, device_map=device_map,
+            )
+            model.load_state_dict(converted, strict=True)
+            processor = BlipProcessor.from_pretrained(model_path)
+            build_prompt = build_prompt_blip2
+        else:
+            from transformers import LlavaForConditionalGeneration, AutoProcessor
+            model = LlavaForConditionalGeneration.from_pretrained(
+                base_model_id, torch_dtype=torch.float16,
+                low_cpu_mem_usage=True, device_map=device_map,
+            )
+            model.load_state_dict(converted, strict=True)
+            processor = AutoProcessor.from_pretrained(model_path, use_fast=False)
+            vcfg = model.config.vision_config
+            processor.patch_size = vcfg.patch_size
+            processor.vision_feature_select_strategy = "full"
+            model.config.vision_feature_select_strategy = "full"
+            if hasattr(model.model, "get_placeholder_mask"):
+                def _patched_get_placeholder_mask(self_, input_ids, image_features, inputs_embeds=None, **kwargs):
+                    image_token_id = self_.config.image_token_index
+                    mask = (input_ids == image_token_id)
+                    if inputs_embeds is not None:
+                        mask = mask.unsqueeze(-1).expand_as(inputs_embeds)
+                    return mask
+                model.model.get_placeholder_mask = types.MethodType(
+                    _patched_get_placeholder_mask, model.model
+                )
+            build_prompt = build_prompt_tinyllava
+        processor.tokenizer.padding_side = "left"  # decoder-only: correct batched generation
+        return model, processor, build_prompt
+
     if model_name == "blip2":
         from transformers import BlipForQuestionAnswering, BlipProcessor
         model = BlipForQuestionAnswering.from_pretrained(
@@ -875,7 +1048,6 @@ def evaluate_single_model(model_name: str, model_path: str, datasets_to_eval: di
             MODEL_CONFIGS["tinyllava"]["model_id"],
             use_fast=False,
         )
-        # patch_size / vision_feature_select_strategy missing in processor config (preprocessing/blip_visual_counterfact.py, run_inference.py)
         vcfg = model.config.vision_config
         processor.patch_size = vcfg.patch_size
         processor.vision_feature_select_strategy = "full"
@@ -891,10 +1063,88 @@ def evaluate_single_model(model_name: str, model_path: str, datasets_to_eval: di
                 _patched_get_placeholder_mask, model.model
             )
         build_prompt = build_prompt_tinyllava
+    if model_name == "tinyllava":
+        processor.tokenizer.padding_side = "left"  # decoder-only: correct batched generation
+    return model, processor, build_prompt
+
+
+def _run_batch_inference(model, processor, device, model_name: str,
+                         batch_items: List[Tuple]) -> List[str]:
+    """
+    Run batched inference on a list of (example, prompt, img, _) items.
+    Returns list of prediction strings, one per item.
+    Mirrors preprocessing/run_inference.py: BLIP uses padding + output_scores and decodes
+    per sequence; TinyLLaVA uses input lengths from attention_mask to slice generated tokens.
+    """
+    if not batch_items:
+        return []
+    images = [item[2] for item in batch_items]
+    prompts = [item[1] for item in batch_items]
+
+    inputs = processor(
+        images=images,
+        text=prompts,
+        return_tensors="pt",
+        padding=True,
+    ).to(device, torch.float16)
+    if "pixel_values" not in inputs:
+        raise RuntimeError(
+            f"{model_name} processor did not return pixel_values; "
+            "image is not being encoded."
+        )
+
+    if model_name == "blip2":
+        out = model.generate(
+            **inputs,
+            max_new_tokens=50,
+            do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+        num_steps = len(out.scores) if out.scores else 0
+        preds = []
+        for i in range(out.sequences.shape[0]):
+            if num_steps == 0:
+                preds.append("")
+            else:
+                gen_ids = out.sequences[i, -num_steps:]
+                preds.append(processor.decode(gen_ids, skip_special_tokens=True).strip())
+        return preds
+    else:
+        # TinyLLaVA (decoder-only): we set padding_side='left' so all sequences share the same
+        # padded length; generated tokens start at that position for every sample.
+        input_len = inputs["input_ids"].shape[1]
+        out = model.generate(
+            **inputs,
+            max_new_tokens=50,
+            do_sample=False,
+            return_dict_in_generate=True,
+        )
+        preds = []
+        for i in range(out.sequences.shape[0]):
+            gen_ids = out.sequences[i, input_len:]
+            preds.append(processor.tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
+        return preds
+
+
+@torch.no_grad()
+def evaluate_single_model(model_name: str, model_path: str, datasets_to_eval: dict,
+                          limit: int = 0, batch_size: int = 64):
+    """
+    Evaluate a single model on all specified datasets with batched inference.
+    Returns {dataset_name: {"accuracy": float, "n_samples": int}}, detail_rows.
+    """
+    flush_gpu()
+    print(f"  Loading model from {model_path}...")
+
+    device_map = "cuda:0" if torch.cuda.is_available() else "auto"
+    model, processor, build_prompt = load_model_and_processor_for_eval(
+        model_name, model_path, device_map
+    )
 
     model.eval()
     device = next(model.parameters()).device
-    print(f"  Model loaded on {device} ({gpu_mem()})")
+    print(f"  Model loaded on {device} ({gpu_mem()}), batch_size={batch_size}")
 
     results = {}
     detail_rows: List[dict] = []
@@ -906,82 +1156,54 @@ def evaluate_single_model(model_name: str, model_path: str, datasets_to_eval: di
         data, n_total, n_eval = _load_eval_data(ds_cfg, limit)
         print(f"    Samples: {n_eval} / {n_total}")
 
-        correct = 0.0
-        evaluated = 0
-
+        # Collect valid (example, prompt, img, orig_idx) for batching
+        valid_items: List[Tuple] = []
         for i in range(n_eval):
             example = data[i]
-
             prompt, img = build_prompt(prompt_style, example)
             if prompt is None or img is None:
                 continue
+            valid_items.append((example, prompt, img, i))
 
-            inputs = processor(images=img, text=prompt, return_tensors="pt").to(device, torch.float16)
-            if "pixel_values" not in inputs:
-                raise RuntimeError(
-                    f"{model_name} processor did not return pixel_values; "
-                    "image is not being encoded."
-                )
-            prompt_len = inputs["input_ids"].shape[1]
+        correct = 0.0
+        evaluated = 0
+        n_valid = len(valid_items)
 
-            if model_name == "blip2":
-                # BLIP: use output_scores to get generated length; sequences may not align with input_ids (preprocessing/run_inference.py BlipVQAInference)
-                out = model.generate(
-                    **inputs,
-                    max_new_tokens=50,
-                    do_sample=False,
-                    return_dict_in_generate=True,
-                    output_scores=True,
-                )
-                num_steps = len(out.scores) if out.scores else 0
-                if num_steps == 0:
-                    prediction = ""
-                else:
-                    gen_ids = out.sequences[0, -num_steps:]
-                    prediction = processor.decode(gen_ids, skip_special_tokens=True).strip()
-            else:
-                out = model.generate(
-                    **inputs,
-                    max_new_tokens=50,
-                    do_sample=False,
-                    return_dict_in_generate=True,
-                )
-                gen_ids = out.sequences[0, prompt_len:]
-                prediction = processor.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+        for start in range(0, n_valid, batch_size):
+            batch_items = valid_items[start : start + batch_size]
+            predictions = _run_batch_inference(
+                model, processor, device, model_name, batch_items
+            )
+            for (example, prompt, _img, orig_i), prediction in zip(batch_items, predictions):
+                gt = extract_answer(prompt_style, example)
+                score = compute_score(prompt_style, prediction, example)
+                correct += score
+                evaluated += 1
 
-            gt = extract_answer(prompt_style, example)
-            score = compute_score(prompt_style, prediction, example)
-            correct += score
-            evaluated += 1
+                sample_id = example.get("id", example.get("question_id", f"{ds_name}_{orig_i}"))
+                gt_str = " | ".join(str(a) for a in gt) if isinstance(gt, list) else str(gt)
+                detail_rows.append({
+                    "id": sample_id,
+                    "dataset": ds_name,
+                    "question": example.get("question", prompt),
+                    "ground_truth": gt_str,
+                    "predicted": prediction,
+                    "correct": 1 if score > 0 else 0,
+                })
 
-            # Per-sample row for CSV (id, dataset, question, ground_truth, predicted, correct)
-            sample_id = example.get("id", example.get("question_id", f"{ds_name}_{i}"))
-            if isinstance(gt, list):
-                gt_str = " | ".join(str(a) for a in gt)
-            else:
-                gt_str = str(gt)
-            detail_rows.append({
-                "id": sample_id,
-                "dataset": ds_name,
-                "question": example.get("question", prompt),
-                "ground_truth": gt_str,
-                "predicted": prediction,
-                "correct": 1 if score > 0 else 0,
-            })
-
-            if evaluated <= DEBUG_EVAL_SAMPLES:
-                if isinstance(gt, list):
-                    gt_str = "[" + ", ".join(str(a)[:30] for a in gt[:3]) + ("]" if len(gt) <= 3 else ", ...]")
-                else:
-                    gt_str = str(gt)[:80] + ("..." if len(str(gt)) > 80 else "")
-                prompt_preview = prompt[:120] + ("..." if len(prompt) > 120 else "")
-                pred_preview = prediction[:120] + ("..." if len(prediction) > 120 else "")
-                print(f"    [sample {evaluated}] in:  {repr(prompt_preview)}")
-                print(f"         out: {repr(pred_preview)}")
-                print(f"         gt:  {gt_str}  -> score={score:.0f}")
+                if evaluated <= DEBUG_EVAL_SAMPLES:
+                    if isinstance(gt, list):
+                        gt_dbg = "[" + ", ".join(str(a)[:30] for a in gt[:3]) + ("]" if len(gt) <= 3 else ", ...]")
+                    else:
+                        gt_dbg = str(gt)[:80] + ("..." if len(str(gt)) > 80 else "")
+                    prompt_preview = prompt[:120] + ("..." if len(prompt) > 120 else "")
+                    pred_preview = prediction[:120] + ("..." if len(prediction) > 120 else "")
+                    print(f"    [sample {evaluated}] in:  {repr(prompt_preview)}")
+                    print(f"         out: {repr(pred_preview)}")
+                    print(f"         gt:  {gt_dbg}  -> score={score:.0f}")
 
             if (evaluated % 100 == 0) and evaluated > 0:
-                print(f"    Progress: {evaluated}/{n_eval}, acc={correct/evaluated:.3f}")
+                print(f"    Progress: {evaluated}/{n_valid}, acc={correct/evaluated:.3f}")
 
         acc = correct / evaluated if evaluated > 0 else 0
         results[ds_name] = {
@@ -998,8 +1220,8 @@ def evaluate_single_model(model_name: str, model_path: str, datasets_to_eval: di
     return results, detail_rows
 
 
-def run_evaluation(quick: bool = False):
-    """Evaluate all baseline + compressed models."""
+def run_evaluation(quick: bool = False, batch_size: int = 64):
+    """Evaluate all baseline + compressed models with batched inference."""
     os.makedirs(RESULTS_DIR, exist_ok=True)
     log = load_log()
 
@@ -1052,6 +1274,7 @@ def run_evaluation(quick: bool = False):
             model_path=j["model_path"],
             datasets_to_eval=datasets_to_eval,
             limit=limit,
+            batch_size=batch_size,
         )
 
         out_dir = os.path.join(RESULTS_DIR, job_name)
@@ -1151,7 +1374,7 @@ def _template():
     for model in ["blip2", "tinyllava"]:
         rows.append([model, "FP16", "—"] + ["—"] * len(EVAL_DATASETS))
         for method in ["wanda", "awq"]:
-            for comp in ["V", "V+P"]:
+            for comp in ["V", "V_P"]:
                 rows.append([model, method, comp] + ["—"] * len(EVAL_DATASETS))
         rows.append([""] * (3 + len(EVAL_DATASETS)))
 
@@ -1170,6 +1393,8 @@ def main():
                         required=True)
     parser.add_argument("--quick", action="store_true",
                         help="Quick test: 1 model, 1 method, 50 samples, lite benchmarks")
+    parser.add_argument("--batch_size", type=int, default=64,
+                        help="Batch size for eval inference (default: 64)")
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -1180,7 +1405,7 @@ def main():
     if args.stage in ("compress", "all"):
         run_compression(quick=args.quick)
     if args.stage in ("eval", "all"):
-        run_evaluation(quick=args.quick)
+        run_evaluation(quick=args.quick, batch_size=args.batch_size)
     if args.stage in ("table", "all"):
         generate_table()
 
