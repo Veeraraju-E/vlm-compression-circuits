@@ -3,6 +3,7 @@ torchvision
 huggingface
 huggingface-hub
 transformers
+safetensors
 datasets
 accelerate
 numpy
