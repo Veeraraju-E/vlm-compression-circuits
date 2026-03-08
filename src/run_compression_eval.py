@@ -1111,8 +1111,6 @@ def _run_batch_inference(model, processor, device, model_name: str,
                 preds.append(processor.decode(gen_ids, skip_special_tokens=True).strip())
         return preds
     else:
-        # TinyLLaVA (decoder-only): we set padding_side='left' so all sequences share the same
-        # padded length; generated tokens start at that position for every sample.
         input_len = inputs["input_ids"].shape[1]
         out = model.generate(
             **inputs,
@@ -1128,8 +1126,7 @@ def _run_batch_inference(model, processor, device, model_name: str,
 
 
 @torch.no_grad()
-def evaluate_single_model(model_name: str, model_path: str, datasets_to_eval: dict,
-                          limit: int = 0, batch_size: int = 64):
+def evaluate_single_model(model_name: str, model_path: str, datasets_to_eval: dict, limit: int = 0, batch_size: int = 64):
     """
     Evaluate a single model on all specified datasets with batched inference.
     Returns {dataset_name: {"accuracy": float, "n_samples": int}}, detail_rows.
@@ -1138,9 +1135,7 @@ def evaluate_single_model(model_name: str, model_path: str, datasets_to_eval: di
     print(f"  Loading model from {model_path}...")
 
     device_map = "cuda:0" if torch.cuda.is_available() else "auto"
-    model, processor, build_prompt = load_model_and_processor_for_eval(
-        model_name, model_path, device_map
-    )
+    model, processor, build_prompt = load_model_and_processor_for_eval(model_name, model_path, device_map)
 
     model.eval()
     device = next(model.parameters()).device
@@ -1171,9 +1166,7 @@ def evaluate_single_model(model_name: str, model_path: str, datasets_to_eval: di
 
         for start in range(0, n_valid, batch_size):
             batch_items = valid_items[start : start + batch_size]
-            predictions = _run_batch_inference(
-                model, processor, device, model_name, batch_items
-            )
+            predictions = _run_batch_inference(model, processor, device, model_name, batch_items)
             for (example, prompt, _img, orig_i), prediction in zip(batch_items, predictions):
                 gt = extract_answer(prompt_style, example)
                 score = compute_score(prompt_style, prediction, example)
