@@ -7,7 +7,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 COMPRESSED_MODELS_DIR = SRC_DIR / "compressed_models"
 CROSSCODER_RESULTS_DIR = SRC_DIR / "crosscoder" / "results"
 
-VISUAL_COUNTERFACT_DIR = DATA_DIR / "Visual-Counterfact"
+# Filtered Visual-Counterfact dataset (from preprocessing) - used for all activation processing
+VISUAL_COUNTERFACT_DIR = OUTPUT_DIR / "counterfactual_selected"
 METADATA_CSV = OUTPUT_DIR / "counterfactual_selected_metadata.csv"
 
 SEED = 42
@@ -18,23 +19,24 @@ EXTRACT_BATCH_SIZE = 128
 NUM_EPOCHS = 150
 CHECKPOINT_EVERY = 100
 
-LAMBDA_SPARSITY = 3e-4
+LAMBDA_SPARSITY = 1e-3
 LAMBDA_CROSS = 0.4
 GRAD_CLIP_NORM = 1.0
 WEIGHT_DECAY = 1e-5
 LAMBDA_SHARED_MULTIPLIER = 0.1
 FORCED_SHARED_FRACTION = 0.06
 
-TOPK_CLS = 128
-TOPK_PATCH = 128
-TOPK_PROJECTOR = 128
+TOPK_CLS = 200
+TOPK_PATCH = 200
+TOPK_PROJECTOR = 200
 
-EXPANSION_FACTOR_VISION = 8 # total neurons in SAE is 768 * 8 = 6144
-EXPANSION_FACTOR_PROJECTOR = 16 # total neurons in SAE  768 * 16 = 12288
+EXPANSION_FACTOR_VISION = 4 # total neurons in SAE is 768 * 4 = 3072
+EXPANSION_FACTOR_PROJECTOR = 4 # total neurons in SAE  768 * 4 = 3072
 
-FVE_THRESHOLD = 0.7
-DEAD_NEURON_THRESHOLD = 0.9
+FVE_THRESHOLD = 0.5
+DEAD_NEURON_THRESHOLD = 1
 
+# Adapts according to experiment-wise rho and theta
 RHO_UNCOMPRESSED_ONLY = 0.15
 RHO_COMPRESSED_ONLY = 0.85
 RHO_SHARED_LOW = 0.35
@@ -43,7 +45,7 @@ THETA_ALIGNED = 0.80
 THETA_REDIRECTED = 0.50
 
 SUPERPOSITION_R2_THRESHOLD = 0.8
-SUPERPOSITION_MAX_CONSTITUENTS = 3
+SUPERPOSITION_MAX_CONSTITUENTS = 50
 SUPERPOSITION_TOP_SAMPLES = 100
 
 AWQ_CALIBRATION_SAMPLES = 256
@@ -76,7 +78,7 @@ BLIP_CROSS_ATTENTION_LAYERS = [9, 10, 11]
 
 ACTIVATION_DIM = {
     "blip2": {"vision": 768, "projector": 768},
-    "tinyllava": {"vision": 768, "projector": 2048},
+    "tinyllava": {"vision": 1024, "projector": 2048},  # CLIP ViT-L hidden_size
 }
 
 MODELS = ["blip2", "tinyllava"]
