@@ -1,57 +1,41 @@
-from pathlib import Path
 from typing import Dict, List, Tuple
 
-import pandas as pd
 import torch
-from datasets import load_from_disk
-from PIL import Image
+from datasets import concatenate_datasets, load_from_disk
 from torch.utils.data import Dataset
 
 from . import config
 
 
 class VisualCounterfactDataset(Dataset):
+    """Loads the filtered Visual-Counterfact dataset from output/counterfactual_selected."""
+
     def __init__(self, split: str = "all"):
-        self.metadata = pd.read_csv(config.METADATA_CSV)
-        if split != "all":
-            self.metadata = self.metadata[self.metadata["split"] == split].reset_index(drop=True)
-        
         self.ds_dict = load_from_disk(str(config.VISUAL_COUNTERFACT_DIR))
-        self.color_ds = self.ds_dict["color"]
-        self.size_ds = self.ds_dict["size"]
-        
-        self._build_index()
-    
-    def _build_index(self):
-        self.sample_to_ds_idx = {}
-        for i, row in enumerate(self.color_ds):
-            sample_id = f"visual_counterfact_color_{i}"
-            self.sample_to_ds_idx[sample_id] = ("color", i)
-        for i, row in enumerate(self.size_ds):
-            sample_id = f"visual_counterfact_size_{i}"
-            self.sample_to_ds_idx[sample_id] = ("size", i)
-    
+        # Filtered dataset has attribute_binding_train and attribute_binding_val splits
+        train_ds = self.ds_dict["attribute_binding_train"]
+        val_ds = self.ds_dict["attribute_binding_val"]
+        all_ds = concatenate_datasets([train_ds, val_ds])
+
+        # Filter by split if needed
+        if split != "all":
+            all_ds = all_ds.filter(lambda x: x.get("split") == split)
+
+        self._data = all_ds
+
     def __len__(self) -> int:
-        return len(self.metadata)
-    
+        return len(self._data)
+
     def __getitem__(self, idx: int) -> Dict:
-        row = self.metadata.iloc[idx]
-        sample_id = row["sample_id"]
-        split_name, ds_idx = self.sample_to_ds_idx[sample_id]
-        
-        if split_name == "color":
-            ds_row = self.color_ds[ds_idx]
-        else:
-            ds_row = self.size_ds[ds_idx]
-        
+        row = self._data[idx]
         return {
-            "sample_id": sample_id,
-            "image_original": ds_row["original_image"],
-            "image_counterfact": ds_row["counterfact_image"],
+            "sample_id": row["sample_id"],
+            "image_original": row["image_original"],
+            "image_counterfact": row["image_counterfact"],
             "question": row["question"],
             "correct_answer": row["correct_answer"],
             "split": row["split"],
-            "source_split": split_name,
+            "source_split": row.get("source_split", "unknown"),
         }
     
     def get_all_samples(self) -> List[Dict]:

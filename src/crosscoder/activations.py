@@ -18,6 +18,33 @@ from .dataset import VisualCounterfactDataset
 from .utils import flush_gpu, get_device, get_compressed_model_path, set_seed
 
 
+def _load_state_dict_from_checkpoint(checkpoint_path: Path) -> Dict[str, torch.Tensor]:
+    """
+    Load model state dict from checkpoint. Supports:
+    - Single file: checkpoint_path / "model.safetensors"
+    - Sharded: checkpoint_path / "model.safetensors.index.json" with weight_map pointing to
+      shard files (e.g. model-00001-of-00002.safetensors). All shards are loaded and merged.
+    """
+    single_file = checkpoint_path / "model.safetensors"
+    index_file = checkpoint_path / "model.safetensors.index.json"
+    if single_file.exists():
+        return load_file(single_file)
+    if index_file.exists():
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
+        shard_files = sorted(set(weight_map.values()))
+        state_dict = {}
+        for shard_name in shard_files:
+            shard_path = checkpoint_path / shard_name
+            state_dict.update(load_file(shard_path))
+        return state_dict
+    raise FileNotFoundError(
+        f"No safetensors found under {checkpoint_path}: "
+        "expected either 'model.safetensors' or 'model.safetensors.index.json' with shard files."
+    )
+
+
 def _unpack_int4(packed: torch.Tensor) -> torch.Tensor:
     out_f, in_packed = packed.shape
     w_q = torch.zeros((out_f, in_packed * 8), dtype=torch.int32, device=packed.device)
@@ -69,7 +96,13 @@ def load_uncompressed_model(model_name: str) -> Tuple:
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
         ).to(device)
-        processor = AutoProcessor.from_pretrained(config.TINYLLAVA_MODEL_ID)
+        processor = AutoProcessor.from_pretrained(
+            config.TINYLLAVA_MODEL_ID, use_fast=False
+        )
+        vcfg = model.config.vision_config
+        processor.patch_size = vcfg.patch_size
+        processor.vision_feature_select_strategy = "full"
+        processor.tokenizer.padding_side = "left"
     model.eval()
     return model, processor
 
@@ -82,8 +115,8 @@ def load_compressed_model(model_name: str, method: str, component: str) -> Tuple
         meta = json.load(f)
     with open(checkpoint_path / "config.json") as f:
         model_config = json.load(f)
-    
-    state_dict = load_file(checkpoint_path / "model.safetensors")
+
+    state_dict = _load_state_dict_from_checkpoint(checkpoint_path)
     
     if method == "awq":
         quantized_layers = model_config.get("quantized_layers", [])
@@ -107,8 +140,14 @@ def load_compressed_model(model_name: str, method: str, component: str) -> Tuple
         )
         model.load_state_dict(state_dict, strict=False)
         model = model.to(device)
-        processor = AutoProcessor.from_pretrained(config.TINYLLAVA_MODEL_ID)
-    
+        processor = AutoProcessor.from_pretrained(
+            config.TINYLLAVA_MODEL_ID, use_fast=False
+        )
+        vcfg = model.config.vision_config
+        processor.patch_size = vcfg.patch_size
+        processor.vision_feature_select_strategy = "full"
+        processor.tokenizer.padding_side = "left"
+
     model.eval()
     return model, processor
 
