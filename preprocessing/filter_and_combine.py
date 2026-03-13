@@ -22,8 +22,8 @@ def _passes_filter(record, require_both_models=True):
 
     (Current pipeline scope is Visual-Counterfact only; no XAITK special cases.)
     """
-    t_correct = record.get("tinyllava_correct_original")
-    t_conf = record.get("tinyllava_confidence_original") or 0.0
+    t_correct = record.get("qwen3vl_correct_original")
+    t_conf = record.get("qwen3vl_confidence_original") or 0.0
     b_correct = record.get("blip_correct_original")
     b_conf = record.get("blip_confidence_original") or 0.0
 

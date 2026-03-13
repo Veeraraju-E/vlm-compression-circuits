@@ -224,16 +224,16 @@ def test_hypothesis_h7(
 
 def test_hypothesis_h8(
     blip_p_metrics: Dict,
-    tinyllava_p_metrics: Dict,
+    qwen3vl_p_metrics: Dict,
 ) -> Dict:
     fsr_blip = blip_p_metrics.get("feature_sharing_ratio", 0.0)
-    fsr_tinyllava = tinyllava_p_metrics.get("feature_sharing_ratio", 0.0)
+    fsr_qwen3vl = qwen3vl_p_metrics.get("feature_sharing_ratio", 0.0)
     
     return {
         "fsr_blip_p": float(fsr_blip),
-        "fsr_tinyllava_p": float(fsr_tinyllava),
-        "hypothesis_supported": fsr_blip > fsr_tinyllava,
-        "description": "H8: BLIP cross-attention has higher FSR than TinyLLaVA MLP projector",
+        "fsr_qwen3vl_p": float(fsr_qwen3vl),
+        "hypothesis_supported": fsr_blip > fsr_qwen3vl,
+        "description": "H8: BLIP cross-attention has higher FSR than Qwen3-VL-2B projector",
     }
 
 

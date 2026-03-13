@@ -1,7 +1,7 @@
 """
-Vision + projector compression (Wanda, AWQ) for BLIP-VQA and TinyLLaVA.
-Models from preprocessing/config.py: BLIP_VQA_MODEL_ID (blip-vqa-base), TINYLLAVA_V1_MODEL_ID.
-Q-VLM is separate: python src/run_qvlm_compression.py --model tinyllava --combo V+P
+Vision + projector compression (Wanda, AWQ) for BLIP-VQA and Qwen3-VL-2B.
+Models from preprocessing/config.py: BLIP_VQA_MODEL_ID (blip-vqa-base), QWEN3VL_2B_MODEL_ID.
+Q-VLM is separate: python src/run_qvlm_compression.py --model qwen3vl --combo V+P
 
 Usage:
     python src/run_compression_eval.py --stage compress
@@ -35,7 +35,7 @@ from tabulate import tabulate
 
 # Model IDs from preprocessing/config.py
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from preprocessing.config import BLIP_VQA_MODEL_ID, TINYLLAVA_V1_MODEL_ID
+from preprocessing.config import BLIP_VQA_MODEL_ID, QWEN3VL_2B_MODEL_ID
 
 COMP_V = "vision"
 COMP_P = "projector"
@@ -47,9 +47,9 @@ MODULE_MAP = {
         COMP_V: "vision_model",
         COMP_P: "text_encoder",
     },
-    "tinyllava": {
-        COMP_V: "model.vision_tower",
-        COMP_P: "model.multi_modal_projector",
+    "qwen3vl": {
+        COMP_V: "model.visual",
+        COMP_P: "model.visual.merger",
     },
 }
 
@@ -73,9 +73,9 @@ MODEL_CONFIGS = {
         "model_class": "BlipForQuestionAnswering",
         "processor_class": "BlipProcessor",
     },
-    "tinyllava": {
-        "model_id": TINYLLAVA_V1_MODEL_ID,
-        "model_class": "LlavaForConditionalGeneration",
+    "qwen3vl": {
+        "model_id": QWEN3VL_2B_MODEL_ID,
+        "model_class": "Qwen3VLForConditionalGeneration",
         "processor_class": "AutoProcessor",
     },
 }
@@ -186,8 +186,8 @@ def load_model(model_name: str):
         )
         processor = BlipProcessor.from_pretrained(cfg["model_id"])
     else:
-        from transformers import LlavaForConditionalGeneration, AutoProcessor
-        model = LlavaForConditionalGeneration.from_pretrained(
+        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
             cfg["model_id"], torch_dtype=torch.float16,
             low_cpu_mem_usage=True, device_map=device_map,
         )
@@ -416,7 +416,7 @@ def run_compression(quick: bool = False):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     log = load_log()
 
-    models = ["tinyllava"] if quick else list(MODEL_CONFIGS.keys())
+    models = ["qwen3vl"] if quick else list(MODEL_CONFIGS.keys())
     methods = ["wanda"] if quick else METHODS
     combos = {"V": COMPONENT_COMBOS["V"]} if quick else COMPONENT_COMBOS
 
@@ -578,8 +578,8 @@ def build_prompt_blip2(dataset_name: str, example: dict) -> Tuple[str, Image.Ima
     return prompt, img
 
 
-def build_prompt_tinyllava(dataset_name: str, example: dict) -> Tuple[str, Image.Image]:
-    """Build prompt + image for TinyLLaVA (USER/ASSISTANT style)"""
+def build_prompt_qwen3vl(dataset_name: str, example: dict) -> Tuple[str, Image.Image]:
+    """Build prompt + image for Qwen3-VL-2B (USER/ASSISTANT style)"""
     img = example.get("image")
     if img is None:
         return None, None
@@ -1003,29 +1003,16 @@ def load_model_and_processor_for_eval(
             processor = BlipProcessor.from_pretrained(model_path)
             build_prompt = build_prompt_blip2
         else:
-            from transformers import LlavaForConditionalGeneration, AutoProcessor
-            model = LlavaForConditionalGeneration.from_pretrained(
+            from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
                 base_model_id, torch_dtype=torch.float16,
                 low_cpu_mem_usage=True, device_map=device_map,
             )
             model.load_state_dict(converted, strict=True)
-            processor = AutoProcessor.from_pretrained(model_path, use_fast=False)
-            vcfg = model.config.vision_config
-            processor.patch_size = vcfg.patch_size
-            processor.vision_feature_select_strategy = "full"
-            model.config.vision_feature_select_strategy = "full"
-            if hasattr(model.model, "get_placeholder_mask"):
-                def _patched_get_placeholder_mask(self_, input_ids, image_features, inputs_embeds=None, **kwargs):
-                    image_token_id = self_.config.image_token_index
-                    mask = (input_ids == image_token_id)
-                    if inputs_embeds is not None:
-                        mask = mask.unsqueeze(-1).expand_as(inputs_embeds)
-                    return mask
-                model.model.get_placeholder_mask = types.MethodType(
-                    _patched_get_placeholder_mask, model.model
-                )
-            build_prompt = build_prompt_tinyllava
-        processor.tokenizer.padding_side = "left"  # decoder-only: correct batched generation
+            processor = AutoProcessor.from_pretrained(model_path)
+            build_prompt = build_prompt_qwen3vl
+        if model_name == "qwen3vl":
+            processor.tokenizer.padding_side = "left"
         return model, processor, build_prompt
 
     if model_name == "blip2":
@@ -1039,31 +1026,16 @@ def load_model_and_processor_for_eval(
         )
         build_prompt = build_prompt_blip2
     else:
-        from transformers import LlavaForConditionalGeneration, AutoProcessor
-        model = LlavaForConditionalGeneration.from_pretrained(
+        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_path, torch_dtype=torch.float16,
             low_cpu_mem_usage=True, device_map=device_map,
         )
         processor = AutoProcessor.from_pretrained(
-            MODEL_CONFIGS["tinyllava"]["model_id"],
-            use_fast=False,
+            MODEL_CONFIGS["qwen3vl"]["model_id"],
         )
-        vcfg = model.config.vision_config
-        processor.patch_size = vcfg.patch_size
-        processor.vision_feature_select_strategy = "full"
-        model.config.vision_feature_select_strategy = "full"
-        if hasattr(model.model, "get_placeholder_mask"):
-            def _patched_get_placeholder_mask(self_, input_ids, image_features, inputs_embeds=None, **kwargs):
-                image_token_id = self_.config.image_token_index
-                mask = (input_ids == image_token_id)
-                if inputs_embeds is not None:
-                    mask = mask.unsqueeze(-1).expand_as(inputs_embeds)
-                return mask
-            model.model.get_placeholder_mask = types.MethodType(
-                _patched_get_placeholder_mask, model.model
-            )
-        build_prompt = build_prompt_tinyllava
-    if model_name == "tinyllava":
+        build_prompt = build_prompt_qwen3vl
+    if model_name == "qwen3vl":
         processor.tokenizer.padding_side = "left"  # decoder-only: correct batched generation
     return model, processor, build_prompt
 
@@ -1074,7 +1046,7 @@ def _run_batch_inference(model, processor, device, model_name: str,
     Run batched inference on a list of (example, prompt, img, _) items.
     Returns list of prediction strings, one per item.
     Mirrors preprocessing/run_inference.py: BLIP uses padding + output_scores and decodes
-    per sequence; TinyLLaVA uses input lengths from attention_mask to slice generated tokens.
+    per sequence; Qwen3-VL uses input lengths from attention_mask to slice generated tokens.
     """
     if not batch_items:
         return []
@@ -1221,7 +1193,7 @@ def run_evaluation(quick: bool = False, batch_size: int = 64):
     datasets_to_eval = EVAL_DATASETS_LITE if quick else EVAL_DATASETS
     limit = 50 if quick else 0  # 0 = full dataset
 
-    models = ["tinyllava", "blip2"] if quick else list(MODEL_CONFIGS.keys())
+    models = ["qwen3vl", "blip2"] if quick else list(MODEL_CONFIGS.keys())
     methods_list = ["wanda"] if quick else METHODS
     combos = {"V": COMPONENT_COMBOS["V"]} if quick else COMPONENT_COMBOS
 
@@ -1364,7 +1336,7 @@ def _template():
     header = ["Model", "Method", "Components"]
     header += list(EVAL_DATASETS.keys())
     rows = []
-    for model in ["blip2", "tinyllava"]:
+    for model in ["blip2", "qwen3vl"]:
         rows.append([model, "FP16", "—"] + ["—"] * len(EVAL_DATASETS))
         for method in ["wanda", "awq"]:
             for comp in ["V", "V_P"]:

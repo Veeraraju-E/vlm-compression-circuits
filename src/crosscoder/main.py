@@ -306,10 +306,10 @@ def run_hypothesis_tests():
         hypothesis_results[f"H7_{model}"] = h7_result
     
     blip_p_dir = get_results_dir("blip2", "wanda", "P", "cls")
-    tinyllava_p_dir = get_results_dir("tinyllava", "wanda", "P", "cls")
+    qwen3vl_p_dir = get_results_dir("qwen3vl", "wanda", "P", "cls")
     blip_p_metrics = load_json(get_metrics_dir(blip_p_dir) / "aggregate_metrics.json")
-    tinyllava_p_metrics = load_json(get_metrics_dir(tinyllava_p_dir) / "aggregate_metrics.json")
-    h8_result = test_hypothesis_h8(blip_p_metrics, tinyllava_p_metrics)
+    qwen3vl_p_metrics = load_json(get_metrics_dir(qwen3vl_p_dir) / "aggregate_metrics.json")
+    h8_result = test_hypothesis_h8(blip_p_metrics, qwen3vl_p_metrics)
     hypothesis_results["H8"] = h8_result
     
     results_df = compile_all_hypothesis_results(hypothesis_results)
@@ -336,7 +336,7 @@ Examples:
         """
     )
     
-    parser.add_argument("--model", type=str, choices=config.MODELS, help="Model name (blip2 or tinyllava)")
+    parser.add_argument("--model", type=str, choices=config.MODELS, help="Model name (blip2 or qwen3vl)")
     parser.add_argument("--method", type=str, choices=config.METHODS, help="Compression method (wanda or awq)")
     parser.add_argument("--component", type=str, choices=config.COMPONENTS, help="Component (V, P, or V_P)")
     parser.add_argument("--token_type", type=str, choices=config.TOKEN_TYPES, default="cls", help="Token type for vision encoder (cls or patch)")

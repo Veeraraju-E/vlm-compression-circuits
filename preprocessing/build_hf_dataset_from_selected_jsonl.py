@@ -28,16 +28,16 @@ from load_sources import load_all_sources  # noqa: E402
 
 
 PRED_KEYS = [
-    "tinyllava_pred_original",
-    "tinyllava_confidence_original",
-    "tinyllava_correct_original",
+    "qwen3vl_pred_original",
+    "qwen3vl_confidence_original",
+    "qwen3vl_correct_original",
     "blip_pred_original",
     "blip_confidence_original",
     "blip_correct_original",
     # keep these if present (harmless for Visual-Counterfact)
-    "tinyllava_pred_counterfact",
-    "tinyllava_confidence_counterfact",
-    "tinyllava_correct_counterfact",
+    "qwen3vl_pred_counterfact",
+    "qwen3vl_confidence_counterfact",
+    "qwen3vl_correct_counterfact",
     "blip_pred_counterfact",
     "blip_confidence_counterfact",
     "blip_correct_counterfact",
