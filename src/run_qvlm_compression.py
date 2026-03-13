@@ -2,7 +2,7 @@
 Q-VLM compression — separate script. Run from project root.
 
 Usage:
-    python src/run_qvlm_compression.py [--model blip2|tinyllava] [--combo V|V+P]
+    python src/run_qvlm_compression.py [--model blip2|qwen3vl] [--combo V|V+P]
 
 Q-VLM must be run from its own repo: https://github.com/ChangyuanWang17/QVLM
 This script generates shell scripts to run Q-VLM for vision (V) and projector (V+P)
@@ -16,7 +16,7 @@ from pathlib import Path
 
 # Align with preprocessing and main eval script
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from preprocessing.config import BLIP2_MODEL_ID, TINYLLAVA_V1_MODEL_ID
+from preprocessing.config import BLIP2_MODEL_ID, QWEN3VL_2B_MODEL_ID
 
 COMP_V = "vision"
 COMP_P = "projector"
@@ -26,9 +26,9 @@ MODULE_MAP = {
         COMP_V: "vision_model",
         COMP_P: "qformer",
     },
-    "tinyllava": {
-        COMP_V: "model.vision_tower",
-        COMP_P: "model.multi_modal_projector",
+    "qwen3vl": {
+        COMP_V: "model.visual",
+        COMP_P: "model.visual.merger",
     },
 }
 
@@ -39,7 +39,7 @@ COMPONENT_COMBOS = {
 
 MODEL_CONFIGS = {
     "blip2": {"model_id": BLIP2_MODEL_ID},
-    "tinyllava": {"model_id": TINYLLAVA_V1_MODEL_ID},
+    "qwen3vl": {"model_id": QWEN3VL_2B_MODEL_ID},
 }
 
 QVLM_CONFIG = {"w_bit": 4, "a_bit": 4, "calib_samples": 64}
@@ -52,7 +52,7 @@ def get_module_paths(model_name: str, components: list) -> list:
 
 def main():
     parser = argparse.ArgumentParser(description="Generate Q-VLM compression scripts (vision + projector only)")
-    parser.add_argument("--model", choices=["blip2", "tinyllava"], default="tinyllava")
+    parser.add_argument("--model", choices=["blip2", "qwen3vl"], default="qwen3vl")
     parser.add_argument("--combo", choices=["V", "V+P"], default="V+P")
     parser.add_argument("--output-dir", default=OUTPUT_BASE, help="Base dir for compressed outputs")
     args = parser.parse_args()

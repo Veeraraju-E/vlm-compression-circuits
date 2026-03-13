@@ -16,19 +16,19 @@ LEARNING_RATE = 3e-4
 WARMUP_FRACTION = 0.05
 BATCH_SIZE = 32
 EXTRACT_BATCH_SIZE = 128
-NUM_EPOCHS = 150
+NUM_EPOCHS = 200
 CHECKPOINT_EVERY = 100
 
 LAMBDA_SPARSITY = 1e-3
 LAMBDA_CROSS = 0.4
 GRAD_CLIP_NORM = 1.0
 WEIGHT_DECAY = 1e-5
-LAMBDA_SHARED_MULTIPLIER = 0.1
+LAMBDA_SHARED_MULTIPLIER = 0.05
 FORCED_SHARED_FRACTION = 0.06
 
-TOPK_CLS = 200
-TOPK_PATCH = 200
-TOPK_PROJECTOR = 200
+TOPK_CLS = 400
+TOPK_PATCH = 400
+TOPK_PROJECTOR = 400
 
 EXPANSION_FACTOR_VISION = 4 # total neurons in SAE is 768 * 4 = 3072
 EXPANSION_FACTOR_PROJECTOR = 4 # total neurons in SAE  768 * 4 = 3072
@@ -51,37 +51,37 @@ SUPERPOSITION_TOP_SAMPLES = 100
 AWQ_CALIBRATION_SAMPLES = 256
 
 BLIP_VQA_MODEL_ID = "Salesforce/blip-vqa-base"
-TINYLLAVA_MODEL_ID = "bczhou/tiny-llava-v1-hf"
+QWEN3VL_2B_MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
 
 MODULE_MAP = {
     "blip2": {
         "vision": "vision_model",
         "projector": "text_encoder",
     },
-    "tinyllava": {
-        "vision": "model.vision_tower",
-        "projector": "model.multi_modal_projector",
+    "qwen3vl": {
+        "vision": "model.visual",
+        "projector": "model.visual.merger",
     },
 }
 
 VISION_HOOK_PATHS = {
     "blip2": "vision_model.encoder.layers",
-    "tinyllava": "model.vision_tower.vision_model.encoder.layers",
+    "qwen3vl": "model.visual.blocks",
 }
 
 PROJECTOR_HOOK_PATHS = {
     "blip2": "text_encoder.encoder.layer",
-    "tinyllava": "model.multi_modal_projector",
+    "qwen3vl": "model.visual.merger",
 }
 
 BLIP_CROSS_ATTENTION_LAYERS = [9, 10, 11]
 
 ACTIVATION_DIM = {
     "blip2": {"vision": 768, "projector": 768},
-    "tinyllava": {"vision": 1024, "projector": 2048},  # CLIP ViT-L hidden_size
+    "qwen3vl": {"vision": 1024, "projector": 2048},
 }
 
-MODELS = ["blip2", "tinyllava"]
+MODELS = ["blip2", "qwen3vl"]
 METHODS = ["wanda", "awq"]
 COMPONENTS = ["V", "P", "V_P"]
 TOKEN_TYPES = ["cls", "patch"]

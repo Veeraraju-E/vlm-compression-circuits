@@ -19,6 +19,7 @@ import random
 from pathlib import Path
 
 from datasets import Dataset, DatasetDict, Features, Image as HFImage, Value, load_dataset
+from huggingface_hub import snapshot_download
 
 # Paths
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -40,29 +41,16 @@ RANDOM_SEED = 42
 
 def _download_compressed_models(repo_id: str, local_dir: Path) -> None:
     """Download compressed model checkpoints from HF into src/compressed_models/."""
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        raise ImportError("Install huggingface_hub: pip install huggingface-hub") from None
-
     local_dir = Path(local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
     print(f"Downloading compressed models from {repo_id} to {local_dir} ...")
-    try:
-        snapshot_download(
-            repo_id=repo_id,
-            repo_type="model",
-            local_dir=str(local_dir),
-            local_dir_use_symlinks=False,
-        )
-        print(f"Done. Compressed models are at: {local_dir}")
-    except Exception as e:
-        err_msg = str(e).lower()
-        if "404" in err_msg or "not found" in err_msg or "repository" in err_msg:
-            print(f"Compressed models repo not found or not accessible: {repo_id}")
-            print(f"  URL: https://huggingface.co/{repo_id}")
-            print("  Upload subdirs (blip2__wanda__V, blip2__awq__P, etc.) or use --dataset-only.")
-        raise
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="model",
+        local_dir=str(local_dir),
+        local_dir_use_symlinks=False,
+    )
+    print(f"Done. Compressed models are at: {local_dir}")
 
 
 def _question_for_split(split_name: str, row: dict) -> str:
@@ -194,7 +182,7 @@ def main() -> None:
         print("\nCrosscoder dataset path: output/counterfactual_selected (relative to repo root).")
     elif do_models:
         print("\nCompressed models path: src/compressed_models/ (relative to repo root).")
-    print("Base models (BLIP-VQA, TinyLLaVA) are loaded by crosscoder from HF by ID (cached by transformers).")
+    print("Base models (BLIP-VQA, Qwen3-VL-2B) are loaded by crosscoder from HF by ID (cached by transformers).")
 
 
 if __name__ == "__main__":

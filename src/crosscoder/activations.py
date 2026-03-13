@@ -10,12 +10,15 @@ from transformers import (
     AutoProcessor,
     BlipForQuestionAnswering,
     BlipProcessor,
-    LlavaForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
 )
 
 from . import config
 from .dataset import VisualCounterfactDataset
 from .utils import flush_gpu, get_device, get_compressed_model_path, set_seed
+
+# Qwen3-VL: use apply_chat_template(..., tokenize=True) so image tokens are correctly inserted (aligned with preprocessing/blip_visual_counterfact.py).
+_DTYPE = torch.float16
 
 
 def _load_state_dict_from_checkpoint(checkpoint_path: Path) -> Dict[str, torch.Tensor]:
@@ -81,6 +84,30 @@ def _awq_state_dict_to_fp16(
     return out
 
 
+def _qwen_inputs_for_sample(processor, image: Image.Image, question: str, device):
+    """Build model inputs for one (image, question) using apply_chat_template(tokenize=True)."""
+    if hasattr(image, "convert"):
+        image = image.convert("RGB")
+    messages = [
+        {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": question}]}
+    ]
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    inputs.pop("token_type_ids", None)
+    for k, v in inputs.items():
+        if hasattr(v, "to"):
+            if v.is_floating_point():
+                inputs[k] = v.to(device=device, dtype=_DTYPE)
+            else:
+                inputs[k] = v.to(device)
+    return inputs
+
+
 def load_uncompressed_model(model_name: str) -> Tuple:
     device = get_device()
     if model_name == "blip2":
@@ -91,18 +118,15 @@ def load_uncompressed_model(model_name: str) -> Tuple:
         ).to(device)
         processor = BlipProcessor.from_pretrained(config.BLIP_VQA_MODEL_ID)
     else:
-        model = LlavaForConditionalGeneration.from_pretrained(
-            config.TINYLLAVA_MODEL_ID,
+        # qwen3vl: Qwen3-VL-2B-Instruct
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            config.QWEN3VL_2B_MODEL_ID,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
         ).to(device)
-        processor = AutoProcessor.from_pretrained(
-            config.TINYLLAVA_MODEL_ID, use_fast=False
-        )
-        vcfg = model.config.vision_config
-        processor.patch_size = vcfg.patch_size
-        processor.vision_feature_select_strategy = "full"
-        processor.tokenizer.padding_side = "left"
+        processor = AutoProcessor.from_pretrained(config.QWEN3VL_2B_MODEL_ID)
+        if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+            processor.tokenizer.padding_side = "left"
     model.eval()
     return model, processor
 
@@ -133,20 +157,16 @@ def load_compressed_model(model_name: str, method: str, component: str) -> Tuple
         model = model.to(device)
         processor = BlipProcessor.from_pretrained(config.BLIP_VQA_MODEL_ID)
     else:
-        model = LlavaForConditionalGeneration.from_pretrained(
-            config.TINYLLAVA_MODEL_ID,
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            config.QWEN3VL_2B_MODEL_ID,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
         )
         model.load_state_dict(state_dict, strict=False)
         model = model.to(device)
-        processor = AutoProcessor.from_pretrained(
-            config.TINYLLAVA_MODEL_ID, use_fast=False
-        )
-        vcfg = model.config.vision_config
-        processor.patch_size = vcfg.patch_size
-        processor.vision_feature_select_strategy = "full"
-        processor.tokenizer.padding_side = "left"
+        processor = AutoProcessor.from_pretrained(config.QWEN3VL_2B_MODEL_ID)
+        if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+            processor.tokenizer.padding_side = "left"
 
     model.eval()
     return model, processor
@@ -329,37 +349,51 @@ def extract_activations_for_config(
     print("Extracting activations (batched)...")
     for i in tqdm(range(0, len(items), batch_size), desc="Processing batches"):
         batch_items = items[i:i + batch_size]
-        images = [it["image"] for it in batch_items]
-        questions = [it["question"] for it in batch_items]
-        
         if model_name == "blip2":
+            images = [it["image"] for it in batch_items]
+            questions = [it["question"] for it in batch_items]
             inputs_u = processor_u(images=images, text=questions, return_tensors="pt", padding=True)
             inputs_c = processor_c(images=images, text=questions, return_tensors="pt", padding=True)
+            inputs_u = {k: v.to(device) for k, v in inputs_u.items()}
+            inputs_c = {k: v.to(device) for k, v in inputs_c.items()}
+            extractor_u.clear()
+            extractor_c.clear()
+            with torch.no_grad():
+                _ = model_u.generate(**inputs_u, max_new_tokens=1)
+                _ = model_c.generate(**inputs_c, max_new_tokens=1)
+            acts_u = extractor_u.extract(token_type)
+            acts_c = extractor_c.extract(token_type)
+            if comp_key in acts_u and comp_key in acts_c:
+                act_u = acts_u[comp_key].cpu()
+                act_c = acts_c[comp_key].cpu()
+                for j, it in enumerate(batch_items):
+                    if j < act_u.shape[0]:
+                        activations_u_list.append(act_u[j])
+                        activations_c_list.append(act_c[j])
+                        sample_ids.append(it["sample_id"])
+                        image_types.append(it["image_type"])
+                        splits.append(it["split"])
         else:
-            prompts = [f"USER: <image>\n{q}\nASSISTANT:" for q in questions]
-            inputs_u = processor_u(images=images, text=prompts, return_tensors="pt", padding=True)
-            inputs_c = processor_c(images=images, text=prompts, return_tensors="pt", padding=True)
-        
-        inputs_u = {k: v.to(device) for k, v in inputs_u.items()}
-        inputs_c = {k: v.to(device) for k, v in inputs_c.items()}
-        
-        extractor_u.clear()
-        extractor_c.clear()
-        
-        with torch.no_grad():
-            _ = model_u.generate(**inputs_u, max_new_tokens=1)
-            _ = model_c.generate(**inputs_c, max_new_tokens=1)
-        
-        acts_u = extractor_u.extract(token_type)
-        acts_c = extractor_c.extract(token_type)
-        
-        if comp_key in acts_u and comp_key in acts_c:
-            act_u = acts_u[comp_key].cpu()
-            act_c = acts_c[comp_key].cpu()
-            for j, it in enumerate(batch_items):
-                if j < act_u.shape[0]:
-                    activations_u_list.append(act_u[j])
-                    activations_c_list.append(act_c[j])
+            # Qwen3-VL: apply_chat_template(..., tokenize=True) per sample (aligned with blip_visual_counterfact.py)
+            for it in batch_items:
+                inputs_u = _qwen_inputs_for_sample(processor_u, it["image"], it["question"], device)
+                inputs_c = _qwen_inputs_for_sample(processor_c, it["image"], it["question"], device)
+                extractor_u.clear()
+                extractor_c.clear()
+                with torch.no_grad():
+                    _ = model_u.generate(**inputs_u, max_new_tokens=1)
+                    _ = model_c.generate(**inputs_c, max_new_tokens=1)
+                acts_u = extractor_u.extract(token_type)
+                acts_c = extractor_c.extract(token_type)
+                if comp_key in acts_u and comp_key in acts_c:
+                    act_u = acts_u[comp_key].cpu().squeeze(0)
+                    act_c = acts_c[comp_key].cpu().squeeze(0)
+                    # Qwen3-VL vision has variable seq length (image-dependent); pool to (hidden_size,) for stacking
+                    if act_u.dim() == 2:
+                        act_u = act_u.mean(dim=0)
+                        act_c = act_c.mean(dim=0)
+                    activations_u_list.append(act_u)
+                    activations_c_list.append(act_c)
                     sample_ids.append(it["sample_id"])
                     image_types.append(it["image_type"])
                     splits.append(it["split"])
@@ -445,39 +479,63 @@ def extract_activations_for_vp_config(
     print("Extracting activations for V+P (batched)...")
     for i in tqdm(range(0, len(items), batch_size), desc="Processing batches"):
         batch_items = items[i:i + batch_size]
-        images = [it["image"] for it in batch_items]
-        questions = [it["question"] for it in batch_items]
-        
         if model_name == "blip2":
+            images = [it["image"] for it in batch_items]
+            questions = [it["question"] for it in batch_items]
             inputs_u = processor_u(images=images, text=questions, return_tensors="pt", padding=True)
             inputs_c = processor_c(images=images, text=questions, return_tensors="pt", padding=True)
+            inputs_u = {k: v.to(device) for k, v in inputs_u.items()}
+            inputs_c = {k: v.to(device) for k, v in inputs_c.items()}
+            extractor_u.clear()
+            extractor_c.clear()
+            with torch.no_grad():
+                _ = model_u.generate(**inputs_u, max_new_tokens=1)
+                _ = model_c.generate(**inputs_c, max_new_tokens=1)
+            acts_u = extractor_u.extract("cls")
+            acts_c = extractor_c.extract("cls")
+            if "vision" in acts_u and "vision" in acts_c and "projector" in acts_u and "projector" in acts_c:
+                v_u, v_c = acts_u["vision"].cpu(), acts_c["vision"].cpu()
+                p_u, p_c = acts_u["projector"].cpu(), acts_c["projector"].cpu()
+                for j, it in enumerate(batch_items):
+                    if j < v_u.shape[0]:
+                        v_activations_u_list.append(v_u[j])
+                        v_activations_c_list.append(v_c[j])
+                        p_activations_u_list.append(p_u[j])
+                        p_activations_c_list.append(p_c[j])
+                        sample_ids.append(it["sample_id"])
+                        image_types.append(it["image_type"])
+                        splits.append(it["split"])
         else:
-            prompts = [f"USER: <image>\n{q}\nASSISTANT:" for q in questions]
-            inputs_u = processor_u(images=images, text=prompts, return_tensors="pt", padding=True)
-            inputs_c = processor_c(images=images, text=prompts, return_tensors="pt", padding=True)
-        
-        inputs_u = {k: v.to(device) for k, v in inputs_u.items()}
-        inputs_c = {k: v.to(device) for k, v in inputs_c.items()}
-        
-        extractor_u.clear()
-        extractor_c.clear()
-        
-        with torch.no_grad():
-            _ = model_u.generate(**inputs_u, max_new_tokens=1)
-            _ = model_c.generate(**inputs_c, max_new_tokens=1)
-        
-        acts_u = extractor_u.extract("cls")
-        acts_c = extractor_c.extract("cls")
-        
-        if "vision" in acts_u and "vision" in acts_c and "projector" in acts_u and "projector" in acts_c:
-            v_u, v_c = acts_u["vision"].cpu(), acts_c["vision"].cpu()
-            p_u, p_c = acts_u["projector"].cpu(), acts_c["projector"].cpu()
-            for j, it in enumerate(batch_items):
-                if j < v_u.shape[0]:
-                    v_activations_u_list.append(v_u[j])
-                    v_activations_c_list.append(v_c[j])
-                    p_activations_u_list.append(p_u[j])
-                    p_activations_c_list.append(p_c[j])
+            # Qwen3-VL: apply_chat_template(..., tokenize=True) per sample (aligned with blip_visual_counterfact.py)
+            for it in batch_items:
+                inputs_u = _qwen_inputs_for_sample(processor_u, it["image"], it["question"], device)
+                inputs_c = _qwen_inputs_for_sample(processor_c, it["image"], it["question"], device)
+                extractor_u.clear()
+                extractor_c.clear()
+                with torch.no_grad():
+                    _ = model_u.generate(**inputs_u, max_new_tokens=1)
+                    _ = model_c.generate(**inputs_c, max_new_tokens=1)
+                acts_u = extractor_u.extract("cls")
+                acts_c = extractor_c.extract("cls")
+                if "vision" in acts_u and "vision" in acts_c and "projector" in acts_u and "projector" in acts_c:
+                    # Vision activations: pool variable-length sequences to a single vector
+                    v_u = acts_u["vision"].cpu().squeeze(0)
+                    v_c = acts_c["vision"].cpu().squeeze(0)
+                    if v_u.dim() == 2:
+                        v_u = v_u.mean(dim=0)
+                        v_c = v_c.mean(dim=0)
+                    v_activations_u_list.append(v_u)
+                    v_activations_c_list.append(v_c)
+
+                    # Projector activations (Qwen3-VL merger) can also have variable sequence length.
+                    # Pool across the sequence dimension so all samples have shape [hidden_size].
+                    p_u = acts_u["projector"].cpu().squeeze(0)
+                    p_c = acts_c["projector"].cpu().squeeze(0)
+                    if p_u.dim() == 2:
+                        p_u = p_u.mean(dim=0)
+                        p_c = p_c.mean(dim=0)
+                    p_activations_u_list.append(p_u)
+                    p_activations_c_list.append(p_c)
                     sample_ids.append(it["sample_id"])
                     image_types.append(it["image_type"])
                     splits.append(it["split"])

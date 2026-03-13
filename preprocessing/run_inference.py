@@ -1,62 +1,26 @@
 """
-Run TinyLLaVA and BLIP-2 on counterfactual samples; return predictions and confidence scores.
+Run Qwen3-VL-2B and BLIP-2 on counterfactual samples; return predictions and confidence scores.
 Confidence = geometric mean of per-token probabilities (from generation scores when available).
 """
 from pathlib import Path
 
-import importlib
-import types
 import torch
 from tqdm import tqdm
 from PIL import Image
 from transformers import (
     AutoProcessor,
-    AutoConfig,
     BlipForQuestionAnswering,
     BlipProcessor,
     Blip2ForConditionalGeneration,
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    LlavaForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
 )
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.utils import is_flash_attn_2_available
 
 from config import (
     BLIP2_MODEL_ID,
     BLIP_VQA_MODEL_ID,
-    TINYLLAVA_MODEL_ID,
-    TINYLLAVA_V1_MODEL_ID,
+    QWEN3VL_2B_MODEL_ID,
 )
-
-def _patch_tinyllava_tie_weights(model_id: str) -> None:
-    """
-    TinyLLaVA uses remote code. Some checkpoints override `tie_weights()` with an older
-    signature, but recent `transformers` calls:
-
-        model.tie_weights(missing_keys=..., recompute_mapping=False)
-
-    during `from_pretrained()`. Patch the remote class method to accept arbitrary kwargs.
-    """
-    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-    auto_map = getattr(cfg, "auto_map", None) or {}
-    class_ref = auto_map.get("AutoModelForCausalLM")
-    if not class_ref:
-        return
-
-    model_cls = get_class_from_dynamic_module(class_ref, model_id)
-    if getattr(model_cls, "_vlm_circuits_tie_weights_patched", False):
-        return
-
-    orig_tie_weights = getattr(model_cls, "tie_weights", None)
-    if orig_tie_weights is None:
-        return
-
-    def tie_weights_compat(self, *args, **kwargs):  # noqa: ARG001
-        return orig_tie_weights(self)
-
-    model_cls.tie_weights = tie_weights_compat
-    model_cls._vlm_circuits_tie_weights_patched = True
 
 
 def _normalize_answer(s):
@@ -160,8 +124,6 @@ def _get_attn_implementation(prefer_flash_attention: bool) -> str:
     Return the attention implementation string for transformers `from_pretrained`.
 
     - "flash_attention_2" requires the `flash-attn` package and a compatible CUDA build.
-    - TinyLLaVA remote code is not fully compatible with transformers attention capability checks,
-      so we keep it on eager regardless.
     """
     if prefer_flash_attention and is_flash_attn_2_available():
         return "flash_attention_2"
@@ -211,88 +173,93 @@ class BlipVQAInference:
         return preds, confs
 
 
-class TinyLLaVAV1Inference:
+class Qwen3VLInference:
     """
-    TinyLLaVA inference for Visual-Counterfact matching `preprocessing/blip_visual_counterfact.py`.
+    Qwen3-VL-2B-Instruct inference for Visual-Counterfact and captioning.
 
-    - Model: `bczhou/tiny-llava-v1-hf` via `LlavaForConditionalGeneration`
-    - Processor: `AutoProcessor(use_fast=False)`
-    - Prompt format:
-        USER: <image>
-        {question}
-        ASSISTANT:
+    - Model: `Qwen/Qwen3-VL-2B-Instruct` via Qwen2_5_VLForConditionalGeneration or Qwen3VLForConditionalGeneration
+    - Processor: AutoProcessor (chat template applied for multi-turn format)
+    - Prompt: chat format with user message containing image + question
     """
 
-    def __init__(self, model_id=TINYLLAVA_V1_MODEL_ID, device=None):
+    def __init__(self, model_id=QWEN3VL_2B_MODEL_ID, device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
 
-        self.processor = AutoProcessor.from_pretrained(model_id, use_fast=False)
-        self.model = LlavaForConditionalGeneration.from_pretrained(
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_id,
             torch_dtype=self.dtype,
             low_cpu_mem_usage=True,
         ).to(self.device)
         self.model.eval()
 
-        vcfg = self.model.config.vision_config
-        self.processor.patch_size = vcfg.patch_size
-        self.processor.vision_feature_select_strategy = "full"
-        self.model.config.vision_feature_select_strategy = "full"
+    def _run_vqa_single(self, image, question: str, max_new_tokens=20):
+        """
+        Run VQA on a single image; returns (text, confidence).
+        Uses apply_chat_template(..., tokenize=True) so image tokens are correctly inserted (aligned with blip_visual_counterfact.py).
+        Decodes only the generated tokens (after prompt_len), not the full sequence.
+        """
+        if hasattr(image, "convert"):
+            image = image.convert("RGB")
+        messages = [
+            {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": question}]}
+        ]
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs.pop("token_type_ids", None)
+        for k, v in inputs.items():
+            if hasattr(v, "to"):
+                if v.is_floating_point():
+                    inputs[k] = v.to(device=self.device, dtype=self.dtype)
+                else:
+                    inputs[k] = v.to(self.device)
+        prompt_len = inputs["input_ids"].shape[1]
 
-        if hasattr(self.model.model, "get_placeholder_mask"):
-            def _patched_get_placeholder_mask(self_, input_ids, image_features, inputs_embeds=None, **kwargs):
-                image_token_id = self_.config.image_token_index
-                mask = (input_ids == image_token_id)  # [B, S]
-                if inputs_embeds is not None:
-                    mask = mask.unsqueeze(-1).expand_as(inputs_embeds)  # [B, S, H]
-                return mask
-
-            self.model.model.get_placeholder_mask = types.MethodType(_patched_get_placeholder_mask, self.model.model)
-
-    @staticmethod
-    def _format_prompt(question: str) -> str:
-        return f"USER: <image>\\n{question}\\nASSISTANT:"
+        out = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+        new_ids = out.sequences[0, prompt_len:]
+        text = self.processor.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+        conf = 0.0
+        if out.scores and new_ids.numel() > 0:
+            k = min(len(out.scores), new_ids.numel())
+            conf = _confidence_from_scores(out.scores[:k], new_ids[:k].tolist())
+        return text, conf
 
     def run_vqa(self, image, question, max_new_tokens=20):
-        preds, confs = self.run_vqa_batch([image], [question], max_new_tokens=max_new_tokens)
-        return preds[0], confs[0]
+        text, conf = self._run_vqa_single(image, question, max_new_tokens=max_new_tokens)
+        return text, conf
 
     def run_vqa_batch(self, images, questions, max_new_tokens=20):
-        # Mirror `preprocessing/blip_visual_counterfact.py` exactly:
-        # process each sample individually, slice off prompt tokens using prompt_len,
-        # then decode only the newly generated tokens.
         preds = []
         confs = []
         for img, q in zip(images, questions):
-            prompt = self._format_prompt(q)
-            inputs = self.processor(
-                text=prompt,
-                images=img,
-                return_tensors="pt",
-            ).to(self.device, self.dtype)
-
-            prompt_len = inputs["input_ids"].shape[1]
-
-            out = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
-
-            # generated_ids contains [prompt_tokens + new_tokens]; keep only new_tokens
-            new_ids = out.sequences[:, prompt_len:][0]
-            text = self.processor.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+            text, conf = self._run_vqa_single(img, q, max_new_tokens=max_new_tokens)
             preds.append(text)
+            confs.append(conf)
+        return preds, confs
 
-            if out.scores and new_ids.numel() > 0:
-                k = min(len(out.scores), new_ids.numel())
-                confs.append(_confidence_from_scores(out.scores[:k], new_ids[:k].tolist()))
-            else:
-                confs.append(0.0)
+    def run_caption(self, image, max_new_tokens=40):
+        """Caption: describe the image."""
+        return self._run_vqa_single(image, "Describe this image briefly.", max_new_tokens=max_new_tokens)
 
+    def run_caption_batch(self, images, max_new_tokens=40):
+        preds = []
+        confs = []
+        for img in images:
+            text, conf = self._run_vqa_single(img, "Describe this image briefly.", max_new_tokens=max_new_tokens)
+            preds.append(text)
+            confs.append(conf)
         return preds, confs
 
 
@@ -413,120 +380,7 @@ class Blip2Inference:
         return preds, confs
 
 
-class TinyLLaVAInference:
-    """TinyLLaVA-3.1B (Phi-2 + SigLIP) inference for VQA and captioning.
-    
-    Uses the conversation template format from TinyLLaVA's remote code:
-    - System prompt + "USER: <image>\\n{question} ASSISTANT:"
-    - The model generates after ASSISTANT:
-    """
-
-    def __init__(self, model_id=TINYLLAVA_MODEL_ID, device=None, prefer_flash_attention=True):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        _patch_tinyllava_tie_weights(model_id)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            trust_remote_code=True,
-            torch_dtype=torch.float16,
-            attn_implementation="eager",
-        ).to(self.device)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        self.model.eval()
-        self._tinyllava_mod = importlib.import_module(self.model.__class__.__module__)
-
-    def run_vqa(self, image, question, max_new_tokens=20):
-        """VQA: Answer the question about the image."""
-        return self._chat_generate(prompt=question, image=image, max_new_tokens=max_new_tokens)
-
-    def run_caption(self, image, max_new_tokens=40):
-        """Caption: Describe the image."""
-        return self._chat_generate(
-            prompt="Describe this image briefly.",
-            image=image,
-            max_new_tokens=max_new_tokens,
-        )
-
-    def _chat_generate(self, prompt, image, max_new_tokens):
-        """Generate response using TinyLLaVA's conversation format.
-        
-        The output sequence from generate() with inputs_embeds does NOT include the input tokens.
-        The returned sequences contain ONLY the generated tokens when using inputs_embeds.
-        We decode these directly to get the response text.
-        """
-        mod = self._tinyllava_mod
-        image_processor = self.model.vision_tower._image_processor
-
-        # Build conversation prompt
-        formatted_prompt = mod.DEFAULT_IMAGE_TOKEN + "\n" + prompt
-        conv = mod.conv_phi_v0.copy()
-        conv.append_message(conv.roles[0], formatted_prompt)
-        conv.append_message(conv.roles[1], None)
-        full_prompt = conv.get_prompt()
-
-        image = image.convert("RGB")
-        image_tensor = mod.process_images([image], image_processor, self.model.config).to(self.device)
-        input_ids = mod.tokenizer_image_token(
-            full_prompt, self.tokenizer, mod.IMAGE_TOKEN_INDEX, return_tensors="pt"
-        ).unsqueeze(0).to(self.device)
-
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = self.tokenizer.eos_token_id
-        
-        attention_mask = torch.ones_like(input_ids)
-
-        out = self.model.generate(
-            input_ids,
-            images=image_tensor,
-            attention_mask=attention_mask,
-            do_sample=False,
-            num_beams=1,
-            pad_token_id=pad_token_id,
-            max_new_tokens=max_new_tokens,
-            use_cache=True,
-            return_dict_in_generate=True,
-            output_scores=True,
-        )
-
-        # Extract generated text
-        # The model's generate with inputs_embeds returns the full sequence including prompt tokens
-        # But after multimodal embedding, the sequence length changes
-        # Use the number of scores as the definitive count of generated tokens
-        num_generated = len(out.scores) if out.scores else 0
-        
-        if num_generated > 0:
-            # Get the last num_generated tokens from the sequence - these are the generated tokens
-            generated_ids = out.sequences[0, -num_generated:]
-            text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-            conf = _confidence_from_scores(out.scores, generated_ids.tolist())
-        else:
-            text = ""
-            conf = 0.0
-        
-        return text, conf
-
-    def run_vqa_batch(self, images, questions, max_new_tokens=20):
-        """Batch VQA - processes sequentially as TinyLLaVA doesn't support true batching."""
-        preds = []
-        confs = []
-        for img, q in zip(images, questions):
-            p, c = self._chat_generate(prompt=q, image=img, max_new_tokens=max_new_tokens)
-            preds.append(p)
-            confs.append(c)
-        return preds, confs
-
-    def run_caption_batch(self, images, max_new_tokens=40):
-        """Batch captioning - processes sequentially."""
-        preds = []
-        confs = []
-        for img in images:
-            p, c = self._chat_generate(prompt="Describe this image briefly.", image=img, max_new_tokens=max_new_tokens)
-            preds.append(p)
-            confs.append(c)
-        return preds, confs
-
-
-def run_both_models_on_record(record, blip, tinyllava, task="vqa", question=None, correct_answer=None, caption_ref=None):
+def run_both_models_on_record(record, blip, qwen3vl, task="vqa", question=None, correct_answer=None, caption_ref=None):
     """
     Run both models on the original image only (no counterfactual predictions).
     
@@ -543,45 +397,45 @@ def run_both_models_on_record(record, blip, tinyllava, task="vqa", question=None
 
     if task == "vqa":
         q = question or record.get("question") or ""
-        t_pred_orig, t_conf_orig = tinyllava.run_vqa(img_orig, q)
+        t_pred_orig, t_conf_orig = qwen3vl.run_vqa(img_orig, q)
         b_pred_orig, b_conf_orig = blip.run_vqa(img_orig, q)
         gt = correct_answer or record.get("correct_answer_normalized") or record.get("correct_answer")
         t_correct = _check_answer_match(t_pred_orig, gt)
         b_correct = _check_answer_match(b_pred_orig, gt)
         
-        record["tinyllava_pred_original"] = t_pred_orig
-        record["tinyllava_confidence_original"] = t_conf_orig
+        record["qwen3vl_pred_original"] = t_pred_orig
+        record["qwen3vl_confidence_original"] = t_conf_orig
         record["blip_pred_original"] = b_pred_orig
         record["blip_confidence_original"] = b_conf_orig
-        record["tinyllava_correct_original"] = t_correct
+        record["qwen3vl_correct_original"] = t_correct
         record["blip_correct_original"] = b_correct
         
     elif task == "caption":
-        t_pred_orig, t_conf_orig = tinyllava.run_caption(img_orig)
+        t_pred_orig, t_conf_orig = qwen3vl.run_caption(img_orig)
         b_pred_orig, b_conf_orig = blip.run_caption(img_orig)
         ref = caption_ref or record.get("caption_original") or record.get("correct_answer")
         t_correct = _caption_match(t_pred_orig, ref)
         b_correct = _caption_match(b_pred_orig, ref)
         
-        record["tinyllava_pred_original"] = t_pred_orig
-        record["tinyllava_confidence_original"] = t_conf_orig
+        record["qwen3vl_pred_original"] = t_pred_orig
+        record["qwen3vl_confidence_original"] = t_conf_orig
         record["blip_pred_original"] = b_pred_orig
         record["blip_confidence_original"] = b_conf_orig
-        record["tinyllava_correct_original"] = t_correct
+        record["qwen3vl_correct_original"] = t_correct
         record["blip_correct_original"] = b_correct
         
         # For image counterfactual, also run on the counterfactual image
         if counterfactual_type == "image":
             img_cf = _image_from_record(record, key_original=False)
             if img_cf is not None:
-                t_pred_cf, t_conf_cf = tinyllava.run_caption(img_cf)
+                t_pred_cf, t_conf_cf = qwen3vl.run_caption(img_cf)
                 b_pred_cf, b_conf_cf = blip.run_caption(img_cf)
                 ref_cf = record.get("caption_counterfact")
-                record["tinyllava_pred_counterfact"] = t_pred_cf
-                record["tinyllava_confidence_counterfact"] = t_conf_cf
+                record["qwen3vl_pred_counterfact"] = t_pred_cf
+                record["qwen3vl_confidence_counterfact"] = t_conf_cf
                 record["blip_pred_counterfact"] = b_pred_cf
                 record["blip_confidence_counterfact"] = b_conf_cf
-                record["tinyllava_correct_counterfact"] = _caption_match(t_pred_cf, ref_cf)
+                record["qwen3vl_correct_counterfact"] = _caption_match(t_pred_cf, ref_cf)
                 record["blip_correct_counterfact"] = _caption_match(b_pred_cf, ref_cf)
 
 
@@ -597,7 +451,7 @@ def run_inference_on_records(
     Current scope: Visual-Counterfact only (VQA on original image only).
     Mirrors the standalone Visual-Counterfact scripts:
     - BLIP VQA: `Salesforce/blip-vqa-base`
-    - TinyLLaVA: `bczhou/tiny-llava-v1-hf`
+    - Qwen3-VL-2B: `Qwen/Qwen3-VL-2B-Instruct`
     """
     if batch_size < 1:
         raise ValueError("batch_size must be >= 1")
@@ -606,7 +460,7 @@ def run_inference_on_records(
     _ = prefer_flash_attention
 
     blip = BlipVQAInference(device=device)
-    tinyllava = TinyLLaVAV1Inference(device=device)
+    qwen3vl = Qwen3VLInference(device=device)
 
     vqa_records = [r for r in records if r.get("task", "vqa") == "vqa"]
 
@@ -628,15 +482,15 @@ def run_inference_on_records(
         images_o = [_image_from_record(r, key_original=True) for r in batch]
         questions = [(r.get("question") or "") for r in batch]
 
-        t_pred_o, t_conf_o = tinyllava.run_vqa_batch(images_o, questions)
+        t_pred_o, t_conf_o = qwen3vl.run_vqa_batch(images_o, questions)
         b_pred_o, b_conf_o = blip.run_vqa_batch(images_o, questions)
 
         for r, tpo, bpo, tconf, bconf in zip(batch, t_pred_o, b_pred_o, t_conf_o, b_conf_o):
-            r["tinyllava_pred_original"] = tpo
-            r["tinyllava_confidence_original"] = tconf
+            r["qwen3vl_pred_original"] = tpo
+            r["qwen3vl_confidence_original"] = tconf
             r["blip_pred_original"] = bpo
             r["blip_confidence_original"] = bconf
             gt = r.get("correct_answer_normalized") or r.get("correct_answer")
-            r["tinyllava_correct_original"] = _check_answer_match(tpo, gt)
+            r["qwen3vl_correct_original"] = _check_answer_match(tpo, gt)
             r["blip_correct_original"] = _check_answer_match(bpo, gt)
         _append_jsonl(batch)

@@ -13,7 +13,7 @@ Build a single HuggingFace dataset from **Visual-Counterfact**, **COCO-Counterfa
 ## Pipeline
 
 1. **Load** sources from `data/` (`load_sources.py`).
-2. **Run inference** with TinyLLaVA and BLIP-2 on original (and counterfactual) images to get predictions and confidence scores (`run_inference.py`).
+2. **Run inference** with Qwen3-VL-2B and BLIP-2 on original (and counterfactual) images to get predictions and confidence scores (`run_inference.py`).
 3. **Filter** to samples where the base model is correct on the original with confidence > 80% (`filter_and_combine.py`).
 4. **Split** by circuit type and create train/val per type (80/20).
 5. **Build** a HuggingFace `DatasetDict` with splits like `attribute_binding_train`, `attribute_binding_val`, etc., and export a **single CSV** with the full sample list and both models’ confidence scores (`build_hf_dataset.py`).
@@ -52,6 +52,6 @@ python build_hf_dataset.py --push-to-hub
 Outputs:
 
 - **Dataset**: `output/counterfactual_unified/` (saved with `datasets.save_to_disk`).
-- **CSV**: `output/counterfactual_unified_metadata.csv` with columns including `sample_id`, `source`, `circuit_type`, `split`, `tinyllava_confidence_original`, `blip_confidence_original`, and both models’ predictions.
+- **CSV**: `output/counterfactual_unified_metadata.csv` with columns including `sample_id`, `source`, `circuit_type`, `split`, `qwen3vl_confidence_original`, `blip_confidence_original`, and both models’ predictions.
 
 Set `HF_DATASET_ID` in `config.py` to your Hub repo before `--push-to-hub`.

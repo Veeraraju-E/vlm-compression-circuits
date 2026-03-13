@@ -34,16 +34,17 @@ VAL_FRACTION = 0.2
 RANDOM_SEED = 42
 
 # Model IDs for inference (Section 1)
-TINYLLAVA_MODEL_ID = "tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B"
+# Qwen3-VL-2B Instruct (official): vision-language model for VQA and captioning.
+QWEN3VL_2B_MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
 BLIP2_MODEL_ID = "Salesforce/blip2-opt-2.7b"
 
 # Dataset-specific inference models
 # Visual-Counterfact is a VQA task: use a VQA-trained BLIP checkpoint.
 BLIP_VQA_MODEL_ID = "Salesforce/blip-vqa-base"
 
-# TinyLLaVA model used in the standalone evaluation scripts for Visual-Counterfact/COCO.
-# (Uses LlavaForConditionalGeneration + AutoProcessor.)
-TINYLLAVA_V1_MODEL_ID = "bczhou/tiny-llava-v1-hf"
+# Backward compatibility aliases (same model as QWEN3VL_2B_MODEL_ID).
+TINYLLAVA_MODEL_ID = QWEN3VL_2B_MODEL_ID
+TINYLLAVA_V1_MODEL_ID = QWEN3VL_2B_MODEL_ID
 
 # HuggingFace dataset
 HF_DATASET_ID = "vlm_circuits/counterfactual_unified"  # or your org/repo name
